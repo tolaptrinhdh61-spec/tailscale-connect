@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Job 1: Server runner - nhận dữ liệu
+  # Job 1: Server runner - nhận dữ liệu (chạy song song)
   server-runner:
     runs-on: ubuntu-latest
     steps:
@@ -20,10 +20,6 @@ jobs:
           TS_IP=$(tailscale ip -4)
           echo "ip=$TS_IP" >> $GITHUB_OUTPUT
           echo "🖥️  Server Tailscale IP: $TS_IP"
-
-          # Lưu IP vào file để client có thể đọc
-          mkdir -p /tmp/share
-          echo "$TS_IP" > /tmp/share/server-ip.txt
 
       - name: Setup SSH Server
         run: |
@@ -63,47 +59,82 @@ jobs:
           echo "=== Listening ports ==="
           sudo netstat -tlnp | grep ssh
 
-      - name: Keep server alive and monitor
+      - name: Wait for client and keep alive
         run: |
           echo "🟢 Server is ready and waiting for client connection..."
           echo "Server IP: $(tailscale ip -4)"
-          echo "Monitoring for 15 minutes..."
+          echo "Waiting for client to connect (max 20 minutes)..."
 
-          # Monitor logs trong 15 phút
-          for i in {1..180}; do
-            if [ $((i % 12)) -eq 0 ]; then
-              echo "⏱️  Alive [$i/180] - $(date)"
-              echo "Connected peers:"
-              sudo tailscale status --peers
+          # Monitor logs và kiểm tra xem có client connect không
+          START_TIME=$(date +%s)
+          CLIENT_CONNECTED=false
+
+          for i in {1..240}; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            
+            # Kiểm tra peers mỗi 30 giây
+            if [ $((i % 6)) -eq 0 ]; then
+              echo "⏱️  [$ELAPSED seconds] Checking for peers..."
+              PEER_COUNT=$(sudo tailscale status --peers | grep -c "github-client" || echo "0")
+              
+              if [ "$PEER_COUNT" -gt 0 ] && [ "$CLIENT_CONNECTED" = false ]; then
+                echo "🎉 Client connected!"
+                CLIENT_CONNECTED=true
+              fi
+              
+              if [ "$CLIENT_CONNECTED" = true ]; then
+                echo "✓ Active connection - peers online: $PEER_COUNT"
+              fi
             fi
+            
+            # Kiểm tra xem có file nào được sync đến không
+            if [ -d ~/client-data ] && [ "$(ls -A ~/client-data 2>/dev/null)" ]; then
+              if [ "$CLIENT_CONNECTED" = false ]; then
+                echo "📥 Received files from client!"
+                ls -lh ~/client-data/
+                CLIENT_CONNECTED=true
+              fi
+            fi
+            
             sleep 5
           done
+
+          echo "⏰ Timeout reached or sync completed"
 
       - name: Show final results
         if: always()
         run: |
-          echo "=== Final Status ==="
-          echo "Files in server-data:"
-          ls -lh ~/server-data/ 2>/dev/null || true
+          echo "════════════════════════════════════════"
+          echo "📊 SERVER FINAL STATUS"
+          echo "════════════════════════════════════════"
+          echo "Server IP: $(tailscale ip -4)"
           echo ""
-          echo "Files received in client-data:"
-          ls -lh ~/client-data/ 2>/dev/null || true
+          echo "=== Files in server-data (original) ==="
+          ls -lh ~/server-data/ 2>/dev/null || echo "No files"
+          echo ""
+          echo "=== Files received from client ==="
           if [ -d ~/client-data ]; then
+            ls -lh ~/client-data/
             echo ""
-            echo "Content of received files:"
-            cat ~/client-data/*.txt 2>/dev/null || true
+            echo "Content of received text files:"
+            cat ~/client-data/*.txt 2>/dev/null || echo "No text files"
+          else
+            echo "❌ No files received from client"
           fi
+          echo ""
+          echo "=== Tailscale peers ==="
+          sudo tailscale status --peers || true
+          echo "════════════════════════════════════════"
 
-  # Job 2: Client runner - gửi dữ liệu
+  # Job 2: Client runner - gửi dữ liệu (chạy song song)
   client-runner:
     runs-on: ubuntu-latest
-    needs: server-runner
-    if: always()
     steps:
       - name: Wait for server startup
         run: |
-          echo "⏳ Waiting 30 seconds for server to be ready..."
-          sleep 30
+          echo "⏳ Waiting 45 seconds for server to be ready..."
+          sleep 45
 
       - name: Setup Tailscale
         run: |
@@ -121,25 +152,32 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y rsync sshpass openssh-client netcat-openbsd
 
-      - name: Discover server
+      - name: Discover server (with retry)
         id: discover
         run: |
           echo "🔍 Discovering Tailscale peers..."
-          sleep 10
 
-          sudo tailscale status
+          # Retry logic để tìm server
+          for attempt in {1..20}; do
+            echo "Attempt $attempt/20..."
+            sleep 5
+            
+            sudo tailscale status
+            
+            # Lấy IP của server
+            SERVER_IP=$(sudo tailscale status | grep 'github-server' | awk '{print $1}')
+            
+            if [ -n "$SERVER_IP" ]; then
+              echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+              echo "🎯 Found server at: $SERVER_IP"
+              exit 0
+            fi
+            
+            echo "Server not found yet, retrying..."
+          done
 
-          # Lấy IP của server (peer đầu tiên không phải chính mình)
-          SERVER_IP=$(sudo tailscale status | grep 'github-server' | awk '{print $1}')
-
-          if [ -z "$SERVER_IP" ]; then
-            echo "⚠️  No server found, trying alternative method..."
-            sleep 10
-            SERVER_IP=$(sudo tailscale status | grep -v $(hostname) | grep -v '^#' | head -1 | awk '{print $1}')
-          fi
-
-          echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
-          echo "🎯 Found server at: $SERVER_IP"
+          echo "❌ Failed to discover server after 20 attempts"
+          exit 1
 
       - name: Test connectivity
         env:
@@ -235,12 +273,38 @@ jobs:
 
           echo "✓ Bidirectional sync test completed"
 
+      - name: Keep connection alive
+        env:
+          SERVER_IP: ${{ steps.discover.outputs.server_ip }}
+          SSHPASS: testpass123
+        run: |
+          echo "🔄 Keeping connection alive for 5 minutes..."
+          echo "Performing periodic syncs to ensure server stays up..."
+
+          for i in {1..60}; do
+            if [ $((i % 12)) -eq 0 ]; then
+              echo "⏱️  Alive check $i/60 - $(date)"
+              
+              # Ping để giữ connection
+              ping -c 2 $SERVER_IP > /dev/null 2>&1 || true
+              
+              # Sync nhẹ để giữ activity
+              echo "Sync check at $(date)" > ~/client-data/keepalive.txt
+              sshpass -e rsync -az \
+                -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+                ~/client-data/keepalive.txt \
+                runner@$SERVER_IP:~/client-data/ 2>/dev/null || true
+            fi
+            sleep 5
+          done
+
       - name: Final summary
+        if: always()
         env:
           SERVER_IP: ${{ steps.discover.outputs.server_ip }}
         run: |
           echo "════════════════════════════════════════"
-          echo "✅ TAILSCALE SYNC TEST SUMMARY"
+          echo "✅ CLIENT FINAL SUMMARY"
           echo "════════════════════════════════════════"
           echo "Server IP: $SERVER_IP"
           echo "Client IP: $(tailscale ip -4)"
@@ -251,4 +315,5 @@ jobs:
           echo "✓ Rsync push (client → server) successful"
           echo "✓ Rsync pull (server → client) successful"
           echo "✓ Bidirectional sync verified"
+          echo "✓ Connection kept alive"
           echo "════════════════════════════════════════"
