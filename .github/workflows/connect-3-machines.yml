@@ -279,14 +279,14 @@ jobs:
             }
           }
 
-      - name: Install rsync and SSH client
+      - name: Install SSH tools (PuTTY)
         run: |
           Write-Host "📦 Installing OpenSSH Client..."
           Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
 
-          Write-Host "📦 Installing cwRsync..."
-          Invoke-WebRequest -Uri "https://github.com/rsync-win/rsync-win/releases/download/v3.3.0/rsync-3.3.0-win64.zip" -OutFile "$env:TEMP\rsync.zip"
-          Expand-Archive -Path "$env:TEMP\rsync.zip" -DestinationPath "C:\rsync" -Force
+          Write-Host "📦 Downloading PuTTY tools (plink, pscp)..."
+          Invoke-WebRequest -Uri "https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe" -OutFile "C:\plink.exe"
+          Invoke-WebRequest -Uri "https://the.earth.li/~sgtatham/putty/latest/w64/pscp.exe" -OutFile "C:\pscp.exe"
 
           Write-Host "✓ Tools installed"
 
@@ -323,22 +323,23 @@ jobs:
 
           $sshConfig | Out-File -FilePath "$sshDir\config" -Encoding ASCII
 
-      - name: Sync TO server using sshpass alternative
+      - name: Sync TO server using PuTTY tools
         shell: powershell
         run: |
           Write-Host "📤 Windows → Server (svr-runner)"
 
-          # Sử dụng plink (PuTTY) cho password authentication
-          Invoke-WebRequest -Uri "https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe" -OutFile "C:\plink.exe"
-          Invoke-WebRequest -Uri "https://the.earth.li/~sgtatham/putty/latest/w64/pscp.exe" -OutFile "C:\pscp.exe"
-
           # Test connection first
+          Write-Host "Testing SSH connection..."
           echo y | C:\plink.exe -batch -pw testpass123 runner@svr-runner "echo 'Connection test OK'"
 
+          # Create target directory on server
+          echo y | C:\plink.exe -batch -pw testpass123 runner@svr-runner "mkdir -p /home/runner/win-data"
+
           # Copy files using pscp (supports password)
+          Write-Host "Copying files..."
           Get-ChildItem "$env:USERPROFILE\win-data" | ForEach-Object {
-            Write-Host "Copying $($_.Name)..."
-            C:\pscp.exe -batch -pw testpass123 -r $_.FullName "runner@svr-runner:/home/runner/win-data/"
+            Write-Host "  Copying $($_.Name)..."
+            C:\pscp.exe -batch -pw testpass123 $_.FullName "runner@svr-runner:/home/runner/win-data/"
           }
 
           Write-Host "✓ Files pushed to server"
