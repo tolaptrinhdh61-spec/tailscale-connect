@@ -1,0 +1,254 @@
+name: Tailscale Runner Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # Job 1: Server runner - nhận dữ liệu
+  server-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=github-server-${{ github.run_id }}
+          sleep 5
+
+      - name: Get Tailscale IP
+        id: ts-ip
+        run: |
+          TS_IP=$(tailscale ip -4)
+          echo "ip=$TS_IP" >> $GITHUB_OUTPUT
+          echo "🖥️  Server Tailscale IP: $TS_IP"
+
+          # Lưu IP vào file để client có thể đọc
+          mkdir -p /tmp/share
+          echo "$TS_IP" > /tmp/share/server-ip.txt
+
+      - name: Setup SSH Server
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server rsync
+
+          # Tạo user và password đơn giản cho test
+          echo "runner:testpass123" | sudo chpasswd
+
+          # Configure SSH để cho phép password login
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+
+          echo "✓ SSH server started on port 22"
+
+      - name: Create test data
+        run: |
+          mkdir -p ~/server-data
+          echo "Hello from Server Runner" > ~/server-data/server-file.txt
+          echo "Server timestamp: $(date)" > ~/server-data/timestamp.txt
+          echo "Random data: $RANDOM-$RANDOM-$RANDOM" > ~/server-data/random.txt
+          dd if=/dev/urandom of=~/server-data/binary-test.dat bs=1M count=5 2>/dev/null
+
+          ls -lh ~/server-data/
+          echo "✓ Test files created"
+
+      - name: Show network info
+        run: |
+          echo "=== Tailscale Status ==="
+          sudo tailscale status
+          echo ""
+          echo "=== IP Addresses ==="
+          ip addr show tailscale0
+          echo ""
+          echo "=== Listening ports ==="
+          sudo netstat -tlnp | grep ssh
+
+      - name: Keep server alive and monitor
+        run: |
+          echo "🟢 Server is ready and waiting for client connection..."
+          echo "Server IP: $(tailscale ip -4)"
+          echo "Monitoring for 15 minutes..."
+
+          # Monitor logs trong 15 phút
+          for i in {1..180}; do
+            if [ $((i % 12)) -eq 0 ]; then
+              echo "⏱️  Alive [$i/180] - $(date)"
+              echo "Connected peers:"
+              sudo tailscale status --peers
+            fi
+            sleep 5
+          done
+
+      - name: Show final results
+        if: always()
+        run: |
+          echo "=== Final Status ==="
+          echo "Files in server-data:"
+          ls -lh ~/server-data/ 2>/dev/null || true
+          echo ""
+          echo "Files received in client-data:"
+          ls -lh ~/client-data/ 2>/dev/null || true
+          if [ -d ~/client-data ]; then
+            echo ""
+            echo "Content of received files:"
+            cat ~/client-data/*.txt 2>/dev/null || true
+          fi
+
+  # Job 2: Client runner - gửi dữ liệu
+  client-runner:
+    runs-on: ubuntu-latest
+    needs: server-runner
+    if: always()
+    steps:
+      - name: Wait for server startup
+        run: |
+          echo "⏳ Waiting 30 seconds for server to be ready..."
+          sleep 30
+
+      - name: Setup Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=github-client-${{ github.run_id }}
+          sleep 5
+
+      - name: Get Tailscale IP
+        run: |
+          TS_IP=$(tailscale ip -4)
+          echo "💻 Client Tailscale IP: $TS_IP"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y rsync sshpass openssh-client netcat-openbsd
+
+      - name: Discover server
+        id: discover
+        run: |
+          echo "🔍 Discovering Tailscale peers..."
+          sleep 10
+
+          sudo tailscale status
+
+          # Lấy IP của server (peer đầu tiên không phải chính mình)
+          SERVER_IP=$(sudo tailscale status | grep 'github-server' | awk '{print $1}')
+
+          if [ -z "$SERVER_IP" ]; then
+            echo "⚠️  No server found, trying alternative method..."
+            sleep 10
+            SERVER_IP=$(sudo tailscale status | grep -v $(hostname) | grep -v '^#' | head -1 | awk '{print $1}')
+          fi
+
+          echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+          echo "🎯 Found server at: $SERVER_IP"
+
+      - name: Test connectivity
+        env:
+          SERVER_IP: ${{ steps.discover.outputs.server_ip }}
+        run: |
+          echo "🏓 Testing ping to $SERVER_IP..."
+          ping -c 5 $SERVER_IP
+
+          echo ""
+          echo "🔌 Testing SSH port (22)..."
+          for i in {1..30}; do
+            if nc -zv -w 5 $SERVER_IP 22 2>&1 | grep -q succeeded; then
+              echo "✓ SSH port is open!"
+              break
+            fi
+            echo "Attempt $i/30 - waiting for SSH..."
+            sleep 5
+          done
+
+      - name: Create client test data
+        run: |
+          mkdir -p ~/client-data
+          echo "Hello from Client Runner" > ~/client-data/client-file.txt
+          echo "Client timestamp: $(date)" > ~/client-data/client-timestamp.txt
+          echo "Test data from client: $RANDOM" > ~/client-data/test.txt
+          dd if=/dev/urandom of=~/client-data/client-binary.dat bs=1M count=3 2>/dev/null
+
+          ls -lh ~/client-data/
+          echo "✓ Client test files created"
+
+      - name: Sync files TO server (rsync push)
+        env:
+          SERVER_IP: ${{ steps.discover.outputs.server_ip }}
+          SSHPASS: testpass123
+        run: |
+          echo "📤 Syncing files TO server..."
+          echo "From: ~/client-data/"
+          echo "To: runner@$SERVER_IP:~/client-data/"
+
+          sshpass -e rsync -avz --progress \
+            -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            ~/client-data/ \
+            runner@$SERVER_IP:~/client-data/
+
+          echo "✓ Push sync completed"
+
+      - name: Sync files FROM server (rsync pull)
+        env:
+          SERVER_IP: ${{ steps.discover.outputs.server_ip }}
+          SSHPASS: testpass123
+        run: |
+          echo "📥 Syncing files FROM server..."
+          echo "From: runner@$SERVER_IP:~/server-data/"
+          echo "To: ~/server-data/"
+
+          mkdir -p ~/server-data
+
+          sshpass -e rsync -avz --progress \
+            -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            runner@$SERVER_IP:~/server-data/ \
+            ~/server-data/
+
+          echo "✓ Pull sync completed"
+
+      - name: Verify synced data
+        run: |
+          echo "=== Files synced FROM server ==="
+          ls -lh ~/server-data/
+          echo ""
+          echo "Content of text files:"
+          cat ~/server-data/*.txt 2>/dev/null || true
+
+          echo ""
+          echo "=== Summary ==="
+          echo "Client data sent: $(du -sh ~/client-data/ | awk '{print $1}')"
+          echo "Server data received: $(du -sh ~/server-data/ | awk '{print $1}')"
+
+      - name: Test bidirectional sync
+        env:
+          SERVER_IP: ${{ steps.discover.outputs.server_ip }}
+          SSHPASS: testpass123
+        run: |
+          echo "🔄 Testing bidirectional sync..."
+
+          # Tạo thêm file mới
+          echo "Additional file created at $(date)" > ~/client-data/additional.txt
+
+          # Sync lại
+          sshpass -e rsync -avz \
+            -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            ~/client-data/ \
+            runner@$SERVER_IP:~/client-data/
+
+          echo "✓ Bidirectional sync test completed"
+
+      - name: Final summary
+        env:
+          SERVER_IP: ${{ steps.discover.outputs.server_ip }}
+        run: |
+          echo "════════════════════════════════════════"
+          echo "✅ TAILSCALE SYNC TEST SUMMARY"
+          echo "════════════════════════════════════════"
+          echo "Server IP: $SERVER_IP"
+          echo "Client IP: $(tailscale ip -4)"
+          echo ""
+          echo "✓ Tailscale network established"
+          echo "✓ Ping test successful"
+          echo "✓ SSH connection successful"
+          echo "✓ Rsync push (client → server) successful"
+          echo "✓ Rsync pull (server → client) successful"
+          echo "✓ Bidirectional sync verified"
+          echo "════════════════════════════════════════"
