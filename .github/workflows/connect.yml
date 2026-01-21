@@ -8,9 +8,13 @@ jobs:
   server-runner:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup Tailscale
+      - name: Setup Tailscale (cached)
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+          # Cài từ package manager (nhanh hơn script)
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y tailscale
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=github-server-${{ github.run_id }}
           sleep 5
 
@@ -57,7 +61,8 @@ jobs:
           ip addr show tailscale0
           echo ""
           echo "=== Listening ports ==="
-          sudo netstat -tlnp | grep ssh
+          sudo netstat -tlnp | grep ssh || echo "SSH not in netstat yet (OK)"
+          sudo systemctl status ssh --no-pager || true
 
       - name: Wait for client and keep alive
         run: |
@@ -136,9 +141,13 @@ jobs:
           echo "⏳ Waiting 45 seconds for server to be ready..."
           sleep 45
 
-      - name: Setup Tailscale
+      - name: Setup Tailscale (cached)
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+          # Cài từ package manager (nhanh hơn script)
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y tailscale
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=github-client-${{ github.run_id }}
           sleep 5
 
@@ -164,19 +173,19 @@ jobs:
             
             sudo tailscale status
             
-            # Lấy IP của server
-            SERVER_IP=$(sudo tailscale status | grep 'github-server' | awk '{print $1}')
+            # Lấy IP của server ĐANG ONLINE (không có "offline")
+            SERVER_IP=$(sudo tailscale status | grep 'github-server' | grep -v 'offline' | awk '{print $1}' | head -1)
             
             if [ -n "$SERVER_IP" ]; then
               echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
-              echo "🎯 Found server at: $SERVER_IP"
+              echo "🎯 Found ONLINE server at: $SERVER_IP"
               exit 0
             fi
             
-            echo "Server not found yet, retrying..."
+            echo "No online server found yet, retrying..."
           done
 
-          echo "❌ Failed to discover server after 20 attempts"
+          echo "❌ Failed to discover online server after 20 attempts"
           exit 1
 
       - name: Test connectivity
