@@ -14,7 +14,9 @@ jobs:
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
           sudo apt-get update -qq
           sudo apt-get install -y tailscale
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=svr-runner
+
+          # Force reauth để chiếm hostname cố định
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=svr-runner --force-reauth
           sleep 5
 
       - name: Get Tailscale info
@@ -127,7 +129,9 @@ jobs:
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
           sudo apt-get update -qq
           sudo apt-get install -y tailscale
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=cli-runner
+
+          # Force reauth để chiếm hostname cố định
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=cli-runner --force-reauth
           sleep 5
 
       - name: Get info
@@ -233,8 +237,8 @@ jobs:
           Write-Host "⏳ Waiting for Tailscale service..."
           Start-Sleep -Seconds 10
 
-          Write-Host "🔌 Connecting to Tailscale with hostname: win-runner"
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=win-runner
+          Write-Host "🔌 Connecting to Tailscale with hostname: win-runner (force reauth)"
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=win-runner --force-reauth
           Start-Sleep -Seconds 5
 
       - name: Get Tailscale info
