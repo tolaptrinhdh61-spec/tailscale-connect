@@ -334,7 +334,7 @@ jobs:
 
           # Test connection first
           Write-Host "Testing SSH connection..."
-          echo y | C:\plink.exe -batch -pw testpass123 runner@svr-runner "echo 'Connection test OK'"
+          echo y | C:\plink.exe -batch -pw testpass123 runner@svr-runner "echo Connection test OK"
 
           # Create target directory on server
           echo y | C:\plink.exe -batch -pw testpass123 runner@svr-runner "mkdir -p /home/runner/win-data"
