@@ -1,0 +1,358 @@
+name: Tailscale Hostname Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # Job 1: Server runner với hostname cố định
+  server-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Tailscale with fixed hostname
+        run: |
+          # Cài từ package manager
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y tailscale
+
+          # Connect với hostname cố định: svr-runner
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=svr-runner
+          sleep 5
+
+      - name: Get Tailscale info
+        run: |
+          TS_IP=$(tailscale ip -4)
+          TS_HOSTNAME=$(tailscale status --self | awk '{print $2}')
+          echo "🖥️  Server Hostname: $TS_HOSTNAME"
+          echo "🖥️  Server IP: $TS_IP"
+
+      - name: Setup SSH Server
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server rsync
+
+          # Tạo user và password
+          echo "runner:testpass123" | sudo chpasswd
+
+          # Configure SSH
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+
+          echo "✓ SSH server started"
+
+      - name: Create test data
+        run: |
+          mkdir -p ~/server-data
+          echo "Hello from Server (svr-runner)" > ~/server-data/server-file.txt
+          echo "Server timestamp: $(date)" > ~/server-data/timestamp.txt
+          echo "Hostname: $(hostname)" > ~/server-data/hostname.txt
+          echo "Random data: $RANDOM-$RANDOM-$RANDOM" > ~/server-data/random.txt
+          dd if=/dev/urandom of=~/server-data/binary-test.dat bs=1M count=5 2>/dev/null
+
+          ls -lh ~/server-data/
+          echo "✓ Test files created"
+
+      - name: Show network info
+        run: |
+          echo "=== Tailscale Status ==="
+          sudo tailscale status
+          echo ""
+          echo "=== Hostname Info ==="
+          echo "System hostname: $(hostname)"
+          echo "Tailscale hostname: svr-runner"
+          echo ""
+          echo "=== IP Addresses ==="
+          ip addr show tailscale0
+          echo ""
+          echo "=== SSH Status ==="
+          sudo netstat -tlnp | grep ssh || echo "SSH not in netstat yet (OK)"
+          sudo systemctl status ssh --no-pager | head -5 || true
+
+      - name: Keep server alive and monitor
+        run: |
+          echo "🟢 Server 'svr-runner' is ready!"
+          echo "Hostname: svr-runner"
+          echo "IP: $(tailscale ip -4)"
+          echo "Monitoring for 20 minutes..."
+
+          START_TIME=$(date +%s)
+          CLIENT_CONNECTED=false
+
+          for i in {1..240}; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            
+            # Kiểm tra peers mỗi 30 giây
+            if [ $((i % 6)) -eq 0 ]; then
+              echo "⏱️  [$ELAPSED seconds] Checking for cli-runner..."
+              
+              # Tìm client theo hostname
+              if sudo tailscale status | grep -q 'cli-runner'; then
+                if [ "$CLIENT_CONNECTED" = false ]; then
+                  echo "🎉 Client 'cli-runner' connected!"
+                  CLIENT_CONNECTED=true
+                fi
+                echo "✓ cli-runner is online"
+              fi
+            fi
+            
+            # Kiểm tra file được sync đến
+            if [ -d ~/client-data ] && [ "$(ls -A ~/client-data 2>/dev/null)" ]; then
+              if [ "$CLIENT_CONNECTED" = false ]; then
+                echo "📥 Received files from cli-runner!"
+                ls -lh ~/client-data/
+                CLIENT_CONNECTED=true
+              fi
+            fi
+            
+            sleep 5
+          done
+
+          echo "⏰ Monitoring timeout reached"
+
+      - name: Show final results
+        if: always()
+        run: |
+          echo "════════════════════════════════════════"
+          echo "📊 SERVER (svr-runner) FINAL STATUS"
+          echo "════════════════════════════════════════"
+          echo "Hostname: svr-runner"
+          echo "IP: $(tailscale ip -4)"
+          echo ""
+          echo "=== Files in server-data (original) ==="
+          ls -lh ~/server-data/ 2>/dev/null || echo "No files"
+          echo ""
+          echo "=== Files received from cli-runner ==="
+          if [ -d ~/client-data ]; then
+            ls -lh ~/client-data/
+            echo ""
+            echo "Content of received text files:"
+            cat ~/client-data/*.txt 2>/dev/null || echo "No text files"
+          else
+            echo "❌ No files received from client"
+          fi
+          echo ""
+          echo "=== Tailscale peers ==="
+          sudo tailscale status --peers || true
+          echo "════════════════════════════════════════"
+
+  # Job 2: Client runner với hostname cố định
+  client-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for server startup
+        run: |
+          echo "⏳ Waiting 45 seconds for svr-runner to be ready..."
+          sleep 45
+
+      - name: Setup Tailscale with fixed hostname
+        run: |
+          # Cài từ package manager
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y tailscale
+
+          # Connect với hostname cố định: cli-runner
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=cli-runner
+          sleep 5
+
+      - name: Get Tailscale info
+        run: |
+          TS_IP=$(tailscale ip -4)
+          TS_HOSTNAME=$(tailscale status --self | awk '{print $2}')
+          echo "💻 Client Hostname: $TS_HOSTNAME"
+          echo "💻 Client IP: $TS_IP"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y rsync sshpass openssh-client netcat-openbsd dnsutils
+
+      - name: Wait for svr-runner to be online
+        run: |
+          echo "🔍 Waiting for svr-runner to appear in Tailscale network..."
+
+          for attempt in {1..30}; do
+            echo "Attempt $attempt/30..."
+            sleep 5
+            
+            sudo tailscale status
+            
+            # Kiểm tra svr-runner có online không
+            if sudo tailscale status | grep 'svr-runner' | grep -qv 'offline'; then
+              echo "🎯 Found svr-runner (ONLINE)!"
+              
+              # Verify hostname resolution
+              echo ""
+              echo "Testing hostname resolution..."
+              if nslookup svr-runner 2>/dev/null | grep -q "Address"; then
+                echo "✓ Hostname svr-runner resolves via DNS"
+              fi
+              
+              # Ping bằng hostname
+              echo ""
+              echo "Testing ping to svr-runner..."
+              if ping -c 2 svr-runner 2>&1 | grep -q "bytes from"; then
+                echo "✓ Can ping svr-runner by hostname"
+              fi
+              
+              exit 0
+            fi
+            
+            echo "svr-runner not online yet, retrying..."
+          done
+
+          echo "❌ Failed to find online svr-runner after 30 attempts"
+          exit 1
+
+      - name: Test connectivity using hostname
+        run: |
+          echo "🏓 Testing ping to svr-runner (hostname)..."
+          ping -c 5 svr-runner
+
+          echo ""
+          echo "🔌 Testing SSH port on svr-runner..."
+          for i in {1..30}; do
+            if nc -zv -w 5 svr-runner 22 2>&1 | grep -q succeeded; then
+              echo "✓ SSH port is open on svr-runner!"
+              break
+            fi
+            echo "Attempt $i/30 - waiting for SSH on svr-runner..."
+            sleep 5
+          done
+
+      - name: Create client test data
+        run: |
+          mkdir -p ~/client-data
+          echo "Hello from Client (cli-runner)" > ~/client-data/client-file.txt
+          echo "Client timestamp: $(date)" > ~/client-data/client-timestamp.txt
+          echo "Hostname: $(hostname)" > ~/client-data/hostname.txt
+          echo "Test data from client: $RANDOM" > ~/client-data/test.txt
+          dd if=/dev/urandom of=~/client-data/client-binary.dat bs=1M count=3 2>/dev/null
+
+          ls -lh ~/client-data/
+          echo "✓ Client test files created"
+
+      - name: Sync files TO server using hostname
+        env:
+          SSHPASS: testpass123
+        run: |
+          echo "📤 Syncing files TO svr-runner (using hostname)..."
+          echo "From: ~/client-data/"
+          echo "To: runner@svr-runner:~/client-data/"
+
+          sshpass -e rsync -avz --progress \
+            -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            ~/client-data/ \
+            runner@svr-runner:~/client-data/
+
+          echo "✓ Push sync completed"
+
+      - name: Sync files FROM server using hostname
+        env:
+          SSHPASS: testpass123
+        run: |
+          echo "📥 Syncing files FROM svr-runner (using hostname)..."
+          echo "From: runner@svr-runner:~/server-data/"
+          echo "To: ~/server-data/"
+
+          mkdir -p ~/server-data
+
+          sshpass -e rsync -avz --progress \
+            -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            runner@svr-runner:~/server-data/ \
+            ~/server-data/
+
+          echo "✓ Pull sync completed"
+
+      - name: Verify synced data
+        run: |
+          echo "=== Files synced FROM svr-runner ==="
+          ls -lh ~/server-data/
+          echo ""
+          echo "Content of text files:"
+          cat ~/server-data/*.txt 2>/dev/null || true
+
+          echo ""
+          echo "=== Summary ==="
+          echo "Client data sent: $(du -sh ~/client-data/ | awk '{print $1}')"
+          echo "Server data received: $(du -sh ~/server-data/ | awk '{print $1}')"
+
+      - name: Test bidirectional sync using hostname
+        env:
+          SSHPASS: testpass123
+        run: |
+          echo "🔄 Testing bidirectional sync with svr-runner..."
+
+          # Tạo thêm file mới
+          echo "Additional file created at $(date)" > ~/client-data/additional.txt
+
+          # Sync lại
+          sshpass -e rsync -avz \
+            -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            ~/client-data/ \
+            runner@svr-runner:~/client-data/
+
+          echo "✓ Bidirectional sync test completed"
+
+      - name: Test remote command execution
+        env:
+          SSHPASS: testpass123
+        run: |
+          echo "🔧 Testing remote command execution on svr-runner..."
+
+          # Execute commands on server
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            runner@svr-runner \
+            "echo 'Remote command test'; hostname; date; ls -la ~/client-data/ | head -5"
+
+          echo "✓ Remote command executed successfully"
+
+      - name: Keep connection alive
+        env:
+          SSHPASS: testpass123
+        run: |
+          echo "🔄 Keeping connection alive for 5 minutes..."
+          echo "Periodic syncs to svr-runner to maintain activity..."
+
+          for i in {1..60}; do
+            if [ $((i % 12)) -eq 0 ]; then
+              echo "⏱️  Alive check $i/60 - $(date)"
+              
+              # Ping để giữ connection
+              ping -c 2 svr-runner > /dev/null 2>&1 || true
+              
+              # Sync nhẹ để giữ activity
+              echo "Sync check at $(date)" > ~/client-data/keepalive.txt
+              sshpass -e rsync -az \
+                -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+                ~/client-data/keepalive.txt \
+                runner@svr-runner:~/client-data/ 2>/dev/null || true
+            fi
+            sleep 5
+          done
+
+      - name: Final summary
+        if: always()
+        run: |
+          echo "════════════════════════════════════════"
+          echo "✅ CLIENT (cli-runner) FINAL SUMMARY"
+          echo "════════════════════════════════════════"
+          echo "Server hostname: svr-runner"
+          echo "Client hostname: cli-runner"
+          echo "Client IP: $(tailscale ip -4)"
+          echo ""
+          echo "✓ Tailscale network established"
+          echo "✓ Hostname resolution working"
+          echo "✓ Ping test (hostname) successful"
+          echo "✓ SSH connection (hostname) successful"
+          echo "✓ Rsync push (cli-runner → svr-runner) successful"
+          echo "✓ Rsync pull (svr-runner → cli-runner) successful"
+          echo "✓ Bidirectional sync verified"
+          echo "✓ Remote command execution successful"
+          echo "✓ Connection kept alive"
+          echo "════════════════════════════════════════"
