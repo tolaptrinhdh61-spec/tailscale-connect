@@ -48,11 +48,11 @@ jobs:
         run: |
           echo "🟢 Server 'svr-runner' is ready!"
           echo "Monitoring for cli-runner (Ubuntu) and win-runner (Windows)..."
-          
+
           START=$(date +%s)
           CLI_CONNECTED=false
           WIN_CONNECTED=false
-          
+
           for i in {1..240}; do
             ELAPSED=$(( $(date +%s) - START ))
             
@@ -226,13 +226,13 @@ jobs:
         run: |
           Write-Host "📥 Downloading Tailscale for Windows..."
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
-          
+
           Write-Host "📦 Installing Tailscale..."
           Start-Process msiexec.exe -ArgumentList "/i $env:TEMP\tailscale.msi /qn /norestart" -Wait
-          
+
           Write-Host "⏳ Waiting for Tailscale service..."
           Start-Sleep -Seconds 10
-          
+
           Write-Host "🔌 Connecting to Tailscale with hostname: win-runner"
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=win-runner
           Start-Sleep -Seconds 5
@@ -263,7 +263,7 @@ jobs:
         run: |
           Write-Host "🏓 Testing ping to svr-runner..."
           Test-Connection -ComputerName svr-runner -Count 5
-          
+
           Write-Host ""
           Write-Host "🔌 Testing SSH port 22 on svr-runner..."
           for ($i = 1; $i -le 30; $i++) {
@@ -283,36 +283,35 @@ jobs:
         run: |
           Write-Host "📦 Installing OpenSSH Client..."
           Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
-          
+
           Write-Host "📦 Installing cwRsync..."
           Invoke-WebRequest -Uri "https://github.com/rsync-win/rsync-win/releases/download/v3.3.0/rsync-3.3.0-win64.zip" -OutFile "$env:TEMP\rsync.zip"
           Expand-Archive -Path "$env:TEMP\rsync.zip" -DestinationPath "C:\rsync" -Force
-          
+
           Write-Host "✓ Tools installed"
 
       - name: Create Windows client data
         run: |
           New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\win-data"
-          
+
           "Hello from Windows Client (win-runner)" | Out-File -FilePath "$env:USERPROFILE\win-data\win-file.txt"
           "Timestamp: $(Get-Date)" | Out-File -FilePath "$env:USERPROFILE\win-data\timestamp.txt"
           "OS: Windows $(Get-ComputerInfo | Select-Object -ExpandProperty WindowsVersion)" | Out-File -FilePath "$env:USERPROFILE\win-data\os-info.txt"
           "Random: $((Get-Random) -join '-')" | Out-File -FilePath "$env:USERPROFILE\win-data\random.txt"
-          
+
           # Create binary file
           $bytes = New-Object byte[] (3MB)
           (New-Object Random).NextBytes($bytes)
           [IO.File]::WriteAllBytes("$env:USERPROFILE\win-data\binary.dat", $bytes)
-          
+
           Get-ChildItem "$env:USERPROFILE\win-data" | Format-Table Name, Length
 
       - name: Setup SSH config for passwordless auth
         run: |
           $sshDir = "$env:USERPROFILE\.ssh"
           New-Item -ItemType Directory -Force -Path $sshDir
-          
-          # Create SSH config
-          @"
+
+          $sshConfig = @"
           Host svr-runner
             HostName svr-runner
             User runner
@@ -320,45 +319,47 @@ jobs:
             UserKnownHostsFile NUL
             PreferredAuthentications password
             PubkeyAuthentication no
-        "@ | Out-File -FilePath "$sshDir\config" -Encoding ASCII
+          "@
+
+          $sshConfig | Out-File -FilePath "$sshDir\config" -Encoding ASCII
 
       - name: Sync TO server using sshpass alternative
         shell: powershell
         run: |
           Write-Host "📤 Windows → Server (svr-runner)"
-          
+
           # Sử dụng plink (PuTTY) cho password authentication
           Invoke-WebRequest -Uri "https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe" -OutFile "C:\plink.exe"
           Invoke-WebRequest -Uri "https://the.earth.li/~sgtatham/putty/latest/w64/pscp.exe" -OutFile "C:\pscp.exe"
-          
+
           # Test connection first
           echo y | C:\plink.exe -batch -pw testpass123 runner@svr-runner "echo 'Connection test OK'"
-          
+
           # Copy files using pscp (supports password)
           Get-ChildItem "$env:USERPROFILE\win-data" | ForEach-Object {
             Write-Host "Copying $($_.Name)..."
             C:\pscp.exe -batch -pw testpass123 -r $_.FullName "runner@svr-runner:/home/runner/win-data/"
           }
-          
+
           Write-Host "✓ Files pushed to server"
 
       - name: Sync FROM server
         shell: powershell
         run: |
           Write-Host "📥 Server → Windows (win-runner)"
-          
+
           New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\server-data"
-          
+
           # Pull files from server
           C:\pscp.exe -batch -pw testpass123 -r "runner@svr-runner:/home/runner/server-data/*" "$env:USERPROFILE\server-data\"
-          
+
           Write-Host "✓ Files pulled from server"
 
       - name: Verify synced data
         run: |
           Write-Host "=== Files synced FROM svr-runner ==="
           Get-ChildItem "$env:USERPROFILE\server-data" | Format-Table Name, Length
-          
+
           Write-Host ""
           Write-Host "Content of text files:"
           Get-ChildItem "$env:USERPROFILE\server-data\*.txt" | ForEach-Object {
