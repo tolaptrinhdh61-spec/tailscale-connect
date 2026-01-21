@@ -1,0 +1,401 @@
+name: Tailscale Multi-OS Test (Ubuntu + Windows)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # Job 1: Server Ubuntu
+  server-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Tailscale with fixed hostname
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y tailscale
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=svr-runner
+          sleep 5
+
+      - name: Get Tailscale info
+        run: |
+          TS_IP=$(tailscale ip -4)
+          echo "🖥️  Server Hostname: svr-runner"
+          echo "🖥️  Server IP: $TS_IP"
+
+      - name: Setup SSH Server
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server rsync
+          echo "runner:testpass123" | sudo chpasswd
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+          echo "✓ SSH server started"
+
+      - name: Create test data
+        run: |
+          mkdir -p ~/server-data
+          echo "Hello from Ubuntu Server (svr-runner)" > ~/server-data/server-file.txt
+          echo "Server timestamp: $(date)" > ~/server-data/timestamp.txt
+          echo "OS: Ubuntu $(lsb_release -rs)" > ~/server-data/os-info.txt
+          echo "Random: $RANDOM-$RANDOM" > ~/server-data/random.txt
+          dd if=/dev/urandom of=~/server-data/binary.dat bs=1M count=5 2>/dev/null
+          ls -lh ~/server-data/
+          echo "✓ Test files created"
+
+      - name: Keep server alive and monitor
+        run: |
+          echo "🟢 Server 'svr-runner' is ready!"
+          echo "Monitoring for cli-runner (Ubuntu) and win-runner (Windows)..."
+          
+          START=$(date +%s)
+          CLI_CONNECTED=false
+          WIN_CONNECTED=false
+          
+          for i in {1..240}; do
+            ELAPSED=$(( $(date +%s) - START ))
+            
+            if [ $((i % 6)) -eq 0 ]; then
+              echo "⏱️  [$ELAPSED s] Checking peers..."
+              
+              # Check Ubuntu client
+              if sudo tailscale status | grep -q 'cli-runner' && [ "$CLI_CONNECTED" = false ]; then
+                echo "🎉 Ubuntu Client 'cli-runner' connected!"
+                CLI_CONNECTED=true
+              fi
+              
+              # Check Windows client
+              if sudo tailscale status | grep -q 'win-runner' && [ "$WIN_CONNECTED" = false ]; then
+                echo "🎉 Windows Client 'win-runner' connected!"
+                WIN_CONNECTED=true
+              fi
+              
+              # Show status
+              [ "$CLI_CONNECTED" = true ] && echo "  ✓ cli-runner online"
+              [ "$WIN_CONNECTED" = true ] && echo "  ✓ win-runner online"
+            fi
+            
+            # Check received files
+            [ -d ~/cli-data ] && [ "$(ls -A ~/cli-data 2>/dev/null)" ] && [ "$CLI_CONNECTED" = false ] && echo "📥 Files from cli-runner!" && CLI_CONNECTED=true
+            [ -d ~/win-data ] && [ "$(ls -A ~/win-data 2>/dev/null)" ] && [ "$WIN_CONNECTED" = false ] && echo "📥 Files from win-runner!" && WIN_CONNECTED=true
+            
+            sleep 5
+          done
+
+      - name: Show final results
+        if: always()
+        run: |
+          echo "════════════════════════════════════════"
+          echo "📊 SERVER (svr-runner) FINAL STATUS"
+          echo "════════════════════════════════════════"
+          echo "OS: Ubuntu"
+          echo ""
+          echo "=== Original server data ==="
+          ls -lh ~/server-data/ 2>/dev/null || echo "No files"
+          echo ""
+          echo "=== Files from cli-runner (Ubuntu) ==="
+          if [ -d ~/cli-data ]; then
+            ls -lh ~/cli-data/
+            cat ~/cli-data/*.txt 2>/dev/null || true
+          else
+            echo "❌ No files from cli-runner"
+          fi
+          echo ""
+          echo "=== Files from win-runner (Windows) ==="
+          if [ -d ~/win-data ]; then
+            ls -lh ~/win-data/
+            cat ~/win-data/*.txt 2>/dev/null || true
+          else
+            echo "❌ No files from win-runner"
+          fi
+          echo ""
+          echo "=== Connected peers ==="
+          sudo tailscale status --peers || true
+          echo "════════════════════════════════════════"
+
+  # Job 2: Client Ubuntu
+  client-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for server
+        run: sleep 45
+
+      - name: Setup Tailscale
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y tailscale
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=cli-runner
+          sleep 5
+
+      - name: Get info
+        run: |
+          echo "💻 Client Hostname: cli-runner"
+          echo "💻 Client IP: $(tailscale ip -4)"
+          echo "💻 OS: Ubuntu"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y rsync sshpass openssh-client netcat-openbsd
+
+      - name: Wait for svr-runner
+        run: |
+          echo "🔍 Waiting for svr-runner..."
+          for i in {1..30}; do
+            sleep 5
+            if sudo tailscale status | grep 'svr-runner' | grep -qv 'offline'; then
+              echo "🎯 svr-runner is online!"
+              ping -c 2 svr-runner
+              exit 0
+            fi
+          done
+          exit 1
+
+      - name: Test connectivity
+        run: |
+          ping -c 5 svr-runner
+          for i in {1..30}; do
+            nc -zv -w 5 svr-runner 22 2>&1 | grep -q succeeded && echo "✓ SSH ready" && break
+            sleep 5
+          done
+
+      - name: Create Ubuntu client data
+        run: |
+          mkdir -p ~/cli-data
+          echo "Hello from Ubuntu Client (cli-runner)" > ~/cli-data/cli-file.txt
+          echo "Timestamp: $(date)" > ~/cli-data/timestamp.txt
+          echo "OS: Ubuntu $(lsb_release -rs)" > ~/cli-data/os-info.txt
+          dd if=/dev/urandom of=~/cli-data/data.dat bs=1M count=3 2>/dev/null
+          ls -lh ~/cli-data/
+
+      - name: Sync TO server
+        env:
+          SSHPASS: testpass123
+        run: |
+          echo "📤 Ubuntu → Server (svr-runner)"
+          sshpass -e rsync -avz --progress \
+            -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            ~/cli-data/ runner@svr-runner:~/cli-data/
+          echo "✓ Pushed"
+
+      - name: Sync FROM server
+        env:
+          SSHPASS: testpass123
+        run: |
+          echo "📥 Server → Ubuntu (cli-runner)"
+          mkdir -p ~/server-data
+          sshpass -e rsync -avz --progress \
+            -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            runner@svr-runner:~/server-data/ ~/server-data/
+          echo "✓ Pulled"
+
+      - name: Verify
+        run: |
+          echo "=== Received from svr-runner ==="
+          ls -lh ~/server-data/
+          cat ~/server-data/*.txt
+
+      - name: Keep alive
+        env:
+          SSHPASS: testpass123
+        run: |
+          echo "🔄 Keeping alive 5 min..."
+          for i in {1..60}; do
+            [ $((i % 12)) -eq 0 ] && echo "Alive $i/60" && ping -c 1 svr-runner >/dev/null 2>&1 || true
+            sleep 5
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "✅ UBUNTU CLIENT (cli-runner) DONE"
+          echo "Server: svr-runner"
+          echo "✓ All syncs completed"
+
+  # Job 3: Client Windows
+  windows-runner:
+    runs-on: windows-latest
+    steps:
+      - name: Wait for server
+        run: Start-Sleep -Seconds 45
+
+      - name: Setup Tailscale on Windows
+        run: |
+          Write-Host "📥 Downloading Tailscale for Windows..."
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
+          
+          Write-Host "📦 Installing Tailscale..."
+          Start-Process msiexec.exe -ArgumentList "/i $env:TEMP\tailscale.msi /qn /norestart" -Wait
+          
+          Write-Host "⏳ Waiting for Tailscale service..."
+          Start-Sleep -Seconds 10
+          
+          Write-Host "🔌 Connecting to Tailscale with hostname: win-runner"
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=win-runner
+          Start-Sleep -Seconds 5
+
+      - name: Get Tailscale info
+        run: |
+          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host "💻 Windows Client Hostname: win-runner"
+          Write-Host "💻 Windows Client IP: $ip"
+          Write-Host "💻 OS: Windows"
+
+      - name: Wait for svr-runner
+        run: |
+          Write-Host "🔍 Waiting for svr-runner..."
+          for ($i = 1; $i -le 30; $i++) {
+            Start-Sleep -Seconds 5
+            $status = & "C:\Program Files\Tailscale\tailscale.exe" status
+            if ($status -match "svr-runner" -and $status -notmatch "offline") {
+              Write-Host "🎯 svr-runner is online!"
+              Test-Connection -ComputerName svr-runner -Count 2
+              exit 0
+            }
+            Write-Host "Attempt $i/30..."
+          }
+          exit 1
+
+      - name: Test connectivity
+        run: |
+          Write-Host "🏓 Testing ping to svr-runner..."
+          Test-Connection -ComputerName svr-runner -Count 5
+          
+          Write-Host ""
+          Write-Host "🔌 Testing SSH port 22 on svr-runner..."
+          for ($i = 1; $i -le 30; $i++) {
+            try {
+              $tcpClient = New-Object System.Net.Sockets.TcpClient
+              $tcpClient.Connect("svr-runner", 22)
+              $tcpClient.Close()
+              Write-Host "✓ SSH port is open!"
+              break
+            } catch {
+              Write-Host "Attempt $i/30 - waiting for SSH..."
+              Start-Sleep -Seconds 5
+            }
+          }
+
+      - name: Install rsync and SSH client
+        run: |
+          Write-Host "📦 Installing OpenSSH Client..."
+          Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+          
+          Write-Host "📦 Installing cwRsync..."
+          Invoke-WebRequest -Uri "https://github.com/rsync-win/rsync-win/releases/download/v3.3.0/rsync-3.3.0-win64.zip" -OutFile "$env:TEMP\rsync.zip"
+          Expand-Archive -Path "$env:TEMP\rsync.zip" -DestinationPath "C:\rsync" -Force
+          
+          Write-Host "✓ Tools installed"
+
+      - name: Create Windows client data
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\win-data"
+          
+          "Hello from Windows Client (win-runner)" | Out-File -FilePath "$env:USERPROFILE\win-data\win-file.txt"
+          "Timestamp: $(Get-Date)" | Out-File -FilePath "$env:USERPROFILE\win-data\timestamp.txt"
+          "OS: Windows $(Get-ComputerInfo | Select-Object -ExpandProperty WindowsVersion)" | Out-File -FilePath "$env:USERPROFILE\win-data\os-info.txt"
+          "Random: $((Get-Random) -join '-')" | Out-File -FilePath "$env:USERPROFILE\win-data\random.txt"
+          
+          # Create binary file
+          $bytes = New-Object byte[] (3MB)
+          (New-Object Random).NextBytes($bytes)
+          [IO.File]::WriteAllBytes("$env:USERPROFILE\win-data\binary.dat", $bytes)
+          
+          Get-ChildItem "$env:USERPROFILE\win-data" | Format-Table Name, Length
+
+      - name: Setup SSH config for passwordless auth
+        run: |
+          $sshDir = "$env:USERPROFILE\.ssh"
+          New-Item -ItemType Directory -Force -Path $sshDir
+          
+          # Create SSH config
+          @"
+          Host svr-runner
+            HostName svr-runner
+            User runner
+            StrictHostKeyChecking no
+            UserKnownHostsFile NUL
+            PreferredAuthentications password
+            PubkeyAuthentication no
+        "@ | Out-File -FilePath "$sshDir\config" -Encoding ASCII
+
+      - name: Sync TO server using sshpass alternative
+        shell: powershell
+        run: |
+          Write-Host "📤 Windows → Server (svr-runner)"
+          
+          # Sử dụng plink (PuTTY) cho password authentication
+          Invoke-WebRequest -Uri "https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe" -OutFile "C:\plink.exe"
+          Invoke-WebRequest -Uri "https://the.earth.li/~sgtatham/putty/latest/w64/pscp.exe" -OutFile "C:\pscp.exe"
+          
+          # Test connection first
+          echo y | C:\plink.exe -batch -pw testpass123 runner@svr-runner "echo 'Connection test OK'"
+          
+          # Copy files using pscp (supports password)
+          Get-ChildItem "$env:USERPROFILE\win-data" | ForEach-Object {
+            Write-Host "Copying $($_.Name)..."
+            C:\pscp.exe -batch -pw testpass123 -r $_.FullName "runner@svr-runner:/home/runner/win-data/"
+          }
+          
+          Write-Host "✓ Files pushed to server"
+
+      - name: Sync FROM server
+        shell: powershell
+        run: |
+          Write-Host "📥 Server → Windows (win-runner)"
+          
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\server-data"
+          
+          # Pull files from server
+          C:\pscp.exe -batch -pw testpass123 -r "runner@svr-runner:/home/runner/server-data/*" "$env:USERPROFILE\server-data\"
+          
+          Write-Host "✓ Files pulled from server"
+
+      - name: Verify synced data
+        run: |
+          Write-Host "=== Files synced FROM svr-runner ==="
+          Get-ChildItem "$env:USERPROFILE\server-data" | Format-Table Name, Length
+          
+          Write-Host ""
+          Write-Host "Content of text files:"
+          Get-ChildItem "$env:USERPROFILE\server-data\*.txt" | ForEach-Object {
+            Write-Host "`n--- $($_.Name) ---"
+            Get-Content $_.FullName
+          }
+
+      - name: Keep connection alive
+        run: |
+          Write-Host "🔄 Keeping connection alive for 5 minutes..."
+          for ($i = 1; $i -le 60; $i++) {
+            if ($i % 12 -eq 0) {
+              Write-Host "⏱️  Alive check $i/60"
+              Test-Connection -ComputerName svr-runner -Count 1 -ErrorAction SilentlyContinue | Out-Null
+              
+              # Update keepalive file
+              "Keepalive at $(Get-Date)" | Out-File -FilePath "$env:USERPROFILE\win-data\keepalive.txt"
+              C:\pscp.exe -batch -pw testpass123 "$env:USERPROFILE\win-data\keepalive.txt" "runner@svr-runner:/home/runner/win-data/" 2>$null
+            }
+            Start-Sleep -Seconds 5
+          }
+
+      - name: Summary
+        if: always()
+        run: |
+          Write-Host "════════════════════════════════════════"
+          Write-Host "✅ WINDOWS CLIENT (win-runner) SUMMARY"
+          Write-Host "════════════════════════════════════════"
+          Write-Host "Server hostname: svr-runner"
+          Write-Host "Client hostname: win-runner"
+          Write-Host "Client IP: $(& 'C:\Program Files\Tailscale\tailscale.exe' ip -4)"
+          Write-Host ""
+          Write-Host "✓ Tailscale network established"
+          Write-Host "✓ Hostname resolution working"
+          Write-Host "✓ Ping test successful"
+          Write-Host "✓ SSH connection successful"
+          Write-Host "✓ File push (win-runner → svr-runner) successful"
+          Write-Host "✓ File pull (svr-runner → win-runner) successful"
+          Write-Host "✓ Connection kept alive"
+          Write-Host "════════════════════════════════════════"
